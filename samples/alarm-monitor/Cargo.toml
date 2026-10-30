@@ -1,0 +1,16 @@
+[package]
+name = "alarm-monitor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Sample Superset module: raises an alarm when the smoothed temperature leaves its limits."
+
+[dependencies]
+axum = "0.8"
+serde_json = "1"
+# In this repository the sample builds against the SDK next to it. In your own module use the
+# release instead:
+# superset-module-sdk = { git = "https://github.com/Newboot-io/superset-module-sdk-rs", tag = "v0.1.0" }
+superset-module-sdk = { path = "../.." }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }

@@ -1,0 +1,16 @@
+# cargo-audit exceptions: this crate builds rumqttc 0.25 from crates.io. Remove this file once a
+# rumqttc release carries upstream bytebeamio/rumqtt PRs #1037 (rustls-webpki 0.103) and #1074 (no
+# rustls-pemfile).
+#
+# rumqttc 0.25 names rustls-webpki 0.102 only as an error type (src/tls.rs, `WebPki(#[from]
+# webpki::Error)`); certificates are verified by rustls 0.23's own verifier on rustls-webpki 0.103.
+# rustls-pemfile only parses the PEM files the module reads; its advisory is "unmaintained".
+[advisories]
+ignore = [
+  "RUSTSEC-2025-0134", # rustls-pemfile unmaintained
+  "RUSTSEC-2026-0049", # rustls-webpki 0.102, unreachable here (see above)
+  "RUSTSEC-2026-0098", # rustls-webpki 0.102, unreachable here
+  "RUSTSEC-2026-0099", # rustls-webpki 0.102, unreachable here
+  "RUSTSEC-2026-0104", # rustls-webpki 0.102, unreachable here
+  "RUSTSEC-2026-0382", # rustls-webpki 0.102, unreachable here
+]
