@@ -473,6 +473,10 @@ async fn run(inner: Arc<Inner>, mut events: EventLoop) {
                     Flow::Next => {}
                     Flow::Stop => break 'connection,
                     Flow::Reconnect => {
+                        // rumqttc keeps its socket after a DISCONNECT it raised itself (a
+                        // protocol error): drop it, so the next poll opens a new connection,
+                        // with the certificates read again, and subscribes again.
+                        events.clean();
                         if inner.pause().await {
                             continue 'connection;
                         }

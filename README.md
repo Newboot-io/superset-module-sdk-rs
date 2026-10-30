@@ -171,8 +171,9 @@ current Tokio runtime, and returns at once: it does not wait for the connection.
 at QoS 1 without retained messages, to `configuration.inputs` and to the module's command topic; a
 refused subscription logs `mqtt: subscription refused` and leaves the client not ready. It never
 fails because of the certificate files: when they are missing or unreadable, or the connection
-drops (a DISCONNECT the MQTT library sends on a protocol error included), it logs `mqtt: <reason>`
-to stderr, waits 5 s, reads the files again and retries; only `close()` stops it. Readiness is
+drops (a protocol error the MQTT library answers with a DISCONNECT included), it logs
+`mqtt: <reason>` to stderr, drops that connection, waits 5 s, reads the files again and opens a new
+connection, subscribing again; only `close()` stops it. Readiness is
 `is_connected()`.
 
 A second `connect()` while started is a no-op and returns `Ok(())`. A `connect()` racing a

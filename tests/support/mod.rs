@@ -130,17 +130,7 @@ impl Pki {
     /// certificate from this CA. Returns the endpoint and the request the server received
     /// (empty when the handshake failed).
     pub async fn serve_once(&self, response: Vec<u8>) -> (String, tokio::task::JoinHandle<String>) {
-        let mut roots = RootCertStore::empty();
-        roots.add(self.ca_cert.clone()).unwrap();
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .unwrap();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.server_key.clone()));
-        let config = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(vec![self.server_cert.clone()], key)
-            .unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let acceptor = self.acceptor();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
@@ -161,6 +151,21 @@ impl Pki {
             String::from_utf8_lossy(&request).into_owned()
         });
         (format!("https://localhost:{port}/twin"), server)
+    }
+
+    /// A TLS acceptor for `localhost` that requires a client certificate from this CA.
+    pub fn acceptor(&self) -> TlsAcceptor {
+        let mut roots = RootCertStore::empty();
+        roots.add(self.ca_cert.clone()).unwrap();
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.server_key.clone()));
+        let config = ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![self.server_cert.clone()], key)
+            .unwrap();
+        TlsAcceptor::from(Arc::new(config))
     }
 }
 
