@@ -83,6 +83,23 @@ pub(crate) fn plain_correlation_id(id: &str) -> bool {
     !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
+/// An error and its source chain on one line ("error sending request: client error (Connect): …").
+/// The URL is left out by the caller.
+fn describe(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        // Some layers repeat their cause's text: keep each part once.
+        if !message.ends_with(&cause_text) {
+            message.push_str(": ");
+            message.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    message
+}
+
 /// Fetches the module twin over HTTPS with the module's client certificate. The certificate
 /// and CA files are read again for every request: they rotate.
 pub(crate) async fn fetch_twin(
@@ -90,7 +107,7 @@ pub(crate) async fn fetch_twin(
     module_id: &str,
     correlation_id: Option<&str>,
 ) -> Result<ModuleTwin> {
-    let http_error = |error: reqwest::Error| Error::twin(error.without_url().to_string());
+    let http_error = |error: reqwest::Error| Error::twin(describe(&error.without_url()));
     let read = |path: &str, what: &str| {
         std::fs::read(path).map_err(|error| Error::twin(format!("cannot read the {what}: {error}")))
     };
@@ -199,6 +216,33 @@ mod tests {
                 ),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn describes_the_whole_source_chain() {
+        let io = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "connection refused");
+        let wrapped = std::io::Error::other(Chain("tcp connect error", io));
+        assert_eq!(describe(&wrapped), "tcp connect error: connection refused");
+        assert_eq!(
+            describe(&Chain("outer", std::io::Error::other("inner"))),
+            "outer: inner"
+        );
+    }
+
+    /// An error with a message and a source.
+    #[derive(Debug)]
+    struct Chain(&'static str, std::io::Error);
+
+    impl std::fmt::Display for Chain {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Chain {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.1)
         }
     }
 

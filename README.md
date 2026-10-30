@@ -148,7 +148,7 @@ object (by variable id); `variable_ids()`, `variable_name(id)` (its `name`, or t
 
 Errors: `Error::Twin(TwinError::NotConfigured)` when the module was deployed without a module twin;
 `Error::Twin(TwinError::Failed(..))` when a certificate file cannot be read or is corrupt, or on
-TLS, timeout, a status other than 200, a body too large or cut short, an answer that is not JSON
+TLS, timeout (the message carries the cause chain, without the URL), a status other than 200, a body too large or cut short, an answer that is not JSON
 (a non-finite number anywhere included), or one that is not this module's.
 
 ### `get_secret(name) -> Result<String>`, `secret_names()` and `check_secrets()`
@@ -166,10 +166,14 @@ value nor the parser's message (which could quote the file).
 
 Starts the MQTT 5 connection over TLS to `brokerUrl` with `mqtt.identity` and `mqtt.ca`, on the
 current Tokio runtime, and returns at once: it does not wait for the connection. Client id:
-`<moduleId>-<HOSTNAME>`. On every connection it subscribes, at QoS 1 without retained messages, to
-`configuration.inputs` and to the module's command topic. It never fails because of the certificate
-files: when they are missing or unreadable, or the connection drops, it logs `mqtt: <reason>` to
-stderr, waits 5 s, reads the files again and retries. Readiness is `is_connected()`.
+`<moduleId>-<host name>`, the host name being `HOSTNAME`, or the kernel's host name
+(`/proc/sys/kernel/hostname`) when `HOSTNAME` is unset or empty. On every connection it subscribes,
+at QoS 1 without retained messages, to `configuration.inputs` and to the module's command topic; a
+refused subscription logs `mqtt: subscription refused` and leaves the client not ready. It never
+fails because of the certificate files: when they are missing or unreadable, or the connection
+drops (a DISCONNECT the MQTT library sends on a protocol error included), it logs `mqtt: <reason>`
+to stderr, waits 5 s, reads the files again and retries; only `close()` stops it. Readiness is
+`is_connected()`.
 
 A second `connect()` while started is a no-op and returns `Ok(())`. A `connect()` racing a
 `close()` either starts first and is stopped by it, or fails with `Error::Closed`.

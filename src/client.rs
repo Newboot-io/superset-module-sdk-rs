@@ -374,10 +374,27 @@ fn route(config: &ModuleConfig, topic: &str, payload: &[u8], retain: bool, now: 
     }
 }
 
+/// The host name when `HOSTNAME` is unset or empty (Linux).
+const KERNEL_HOSTNAME: &str = "/proc/sys/kernel/hostname";
+
+/// The first non-empty of `HOSTNAME` and the kernel's host name; empty when neither is set.
+fn pick_hostname(env: Option<&str>, kernel: Option<&str>) -> String {
+    [env, kernel]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// The connection options, without the TLS transport (read before every connection).
 fn mqtt_options(config: &ModuleConfig) -> Result<MqttOptions> {
     let (host, port) = config.broker_address()?;
-    let hostname = std::env::var("HOSTNAME").unwrap_or_default();
+    let hostname = pick_hostname(
+        std::env::var("HOSTNAME").ok().as_deref(),
+        std::fs::read_to_string(KERNEL_HOSTNAME).ok().as_deref(),
+    );
     let client_id = format!("{}-{hostname}", config.target.module_id);
     let mut options = MqttOptions::new(client_id, host, port);
     // rumqttc drops the connection over a message above its limit (10 KiB unless set): raise it
@@ -396,6 +413,46 @@ fn transport(mqtt: &Mqtt) -> std::io::Result<Transport> {
     }))
 }
 
+/// What the connection's task does after one event.
+#[derive(Debug, PartialEq)]
+enum Flow {
+    /// Poll the next event.
+    Next,
+    /// Wait [`RECONNECT_AFTER`], read the certificates again and reconnect.
+    Reconnect,
+    /// The client closed: end the task.
+    Stop,
+}
+
+fn handle(inner: &Arc<Inner>, event: Event) -> Flow {
+    match event {
+        Event::Incoming(Packet::ConnAck(..)) => inner.subscribe(),
+        Event::Incoming(Packet::SubAck(ack)) => {
+            let granted = ack
+                .return_codes
+                .iter()
+                .all(|code| matches!(code, SubscribeReasonCode::Success(_)));
+            if !granted {
+                eprintln!("mqtt: subscription refused");
+            }
+            inner.connected.store(granted, Ordering::Release);
+        }
+        Event::Incoming(Packet::Publish(message)) => inner.receive(message),
+        // A DISCONNECT goes out on close(), and also when rumqttc meets a protocol error:
+        // only close() ends the task.
+        Event::Outgoing(Outgoing::Disconnect) => {
+            inner.connected.store(false, Ordering::Release);
+            if inner.closed.load(Ordering::Acquire) {
+                return Flow::Stop;
+            }
+            eprintln!("mqtt: disconnected");
+            return Flow::Reconnect;
+        }
+        _ => {}
+    }
+    Flow::Next
+}
+
 async fn run(inner: Arc<Inner>, mut events: EventLoop) {
     'connection: loop {
         match transport(&inner.config.mqtt) {
@@ -412,17 +469,16 @@ async fn run(inner: Arc<Inner>, mut events: EventLoop) {
         }
         loop {
             match events.poll().await {
-                Ok(Event::Incoming(Packet::ConnAck(..))) => inner.subscribe(),
-                Ok(Event::Incoming(Packet::SubAck(ack))) => {
-                    let granted = ack
-                        .return_codes
-                        .iter()
-                        .all(|code| matches!(code, SubscribeReasonCode::Success(_)));
-                    inner.connected.store(granted, Ordering::Release);
-                }
-                Ok(Event::Incoming(Packet::Publish(message))) => inner.receive(message),
-                Ok(Event::Outgoing(Outgoing::Disconnect)) => break 'connection,
-                Ok(_) => {}
+                Ok(event) => match handle(&inner, event) {
+                    Flow::Next => {}
+                    Flow::Stop => break 'connection,
+                    Flow::Reconnect => {
+                        if inner.pause().await {
+                            continue 'connection;
+                        }
+                        break 'connection;
+                    }
+                },
                 Err(error) => {
                     inner.connected.store(false, Ordering::Release);
                     if inner.closed.load(Ordering::Acquire) {
@@ -570,6 +626,53 @@ mod tests {
             assert!(client.inner.task.lock().unwrap().is_none());
             assert!(matches!(client.connect().await, Err(Error::Closed)));
         }
+    }
+
+    fn suback(return_codes: Vec<SubscribeReasonCode>) -> Event {
+        Event::Incoming(Packet::SubAck(rumqttc::v5::mqttbytes::v5::SubAck {
+            pkid: 1,
+            return_codes,
+            properties: None,
+        }))
+    }
+
+    #[test]
+    fn a_disconnect_reconnects_unless_the_client_closed() {
+        let client = ModuleClient::new(config());
+        client.inner.connected.store(true, Ordering::Release);
+        let disconnect = || Event::Outgoing(Outgoing::Disconnect);
+        // A protocol error makes rumqttc send DISCONNECT: the task reconnects.
+        assert_eq!(handle(&client.inner, disconnect()), Flow::Reconnect);
+        assert!(!client.is_connected());
+        client.inner.closed.store(true, Ordering::Release);
+        assert_eq!(handle(&client.inner, disconnect()), Flow::Stop);
+    }
+
+    #[test]
+    fn ready_only_when_every_subscription_is_granted() {
+        let client = ModuleClient::new(config());
+        let granted = SubscribeReasonCode::Success(QoS::AtLeastOnce);
+        assert_eq!(
+            handle(&client.inner, suback(vec![granted, granted])),
+            Flow::Next
+        );
+        assert!(client.is_connected());
+        let refused = suback(vec![granted, SubscribeReasonCode::NotAuthorized]);
+        assert_eq!(handle(&client.inner, refused), Flow::Next);
+        assert!(!client.is_connected());
+        assert_eq!(
+            handle(&client.inner, Event::Outgoing(Outgoing::PingReq)),
+            Flow::Next
+        );
+    }
+
+    #[test]
+    fn the_client_id_falls_back_to_the_kernel_host_name() {
+        assert_eq!(pick_hostname(Some("pod-1"), Some("node\n")), "pod-1");
+        assert_eq!(pick_hostname(Some(""), Some("node\n")), "node");
+        assert_eq!(pick_hostname(None, Some(" node \n")), "node");
+        assert_eq!(pick_hostname(Some("  "), None), "");
+        assert_eq!(pick_hostname(None, None), "");
     }
 
     #[test]

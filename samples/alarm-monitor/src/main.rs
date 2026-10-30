@@ -7,7 +7,7 @@ use alarm::{temp_avg, AlarmState, Limits, Owned, ALARM, ALARM_COUNT};
 use axum::{http::StatusCode, routing::get, Router};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use superset_module_sdk::{ModuleClient, ModuleTwin};
+use superset_module_sdk::{Error, ModuleClient, ModuleTwin, TwinError};
 
 const ALERT_TOKEN: &str = "alert-token";
 const HEALTH_PORT: u16 = 8080;
@@ -85,6 +85,8 @@ async fn main() {
     let twin = loop {
         match client.get_twin(None).await {
             Ok(twin) => break twin,
+            // Deployed without a twin: waiting cannot help.
+            Err(error @ Error::Twin(TwinError::NotConfigured)) => fail(error),
             Err(error) => eprintln!("{error}"),
         }
         tokio::time::sleep(RETRY_TWIN_AFTER).await;

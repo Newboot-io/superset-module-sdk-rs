@@ -6,6 +6,9 @@ On every `temp_avg` it receives it sends two readings: `alarm` (0 or 1) and `ala
 times the alarm went from 0 to 1 since the module started). Each time the alarm is raised it logs
 `alert would be sent`: a real module would call a webhook with its `alert-token` secret here.
 
+At start it waits for its module twin, retrying every 3 s while the fetch fails; deployed without
+a twin it stops at once, since it would know neither its limits nor its variables.
+
 It uses only the SDK's public API and serves `/healthz` and `/readyz` (ready once connected and
 subscribed) on port 8080.
 

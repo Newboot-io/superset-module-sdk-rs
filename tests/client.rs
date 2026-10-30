@@ -80,6 +80,16 @@ async fn get_twin_requests_the_endpoint_path_and_query_as_given() {
 }
 
 #[tokio::test]
+async fn twin_errors_carry_the_cause() {
+    let pki = Pki::new();
+    // Nothing listens on port 1.
+    let client = ModuleClient::new(pki.config(Some("https://localhost:1/twin"), &[]));
+    let error = client.get_twin(None).await.unwrap_err().to_string();
+    assert!(error.to_ascii_lowercase().contains("refused"), "{error}");
+    assert!(!error.contains("localhost:1"), "the URL stays out: {error}");
+}
+
+#[tokio::test]
 async fn corrupt_certificates_are_twin_errors() {
     for corrupt in ["identity", "ca"] {
         let pki = Pki::new();
