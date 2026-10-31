@@ -1,6 +1,6 @@
 """Drives the running alarm-monitor sample: sends it smoothed temperatures (`temp_avg`) as the
 smoother sample would and checks its `alarm` and `alarm_count` readings, its silence on other
-inputs, and its limits after a reload.
+inputs, its limits after a reload, and its flow metrics.
 
 e2e/run.sh then checks the module's log: one "alert would be sent" per raised alarm (the last line
 this script prints before ALL CHECKS PASSED gives the count) and never the alert token."""
@@ -13,7 +13,18 @@ import time
 import urllib.request
 
 import paho.mqtt.client as mqtt
-from fixtures import ALARM_COUNT_VARIABLE, ALARM_VARIABLE, CLUSTER, MODULE, NODE, TENANT
+from fixtures import (
+    ALARM_COUNT_VARIABLE,
+    ALARM_VARIABLE,
+    CLUSTER,
+    FLOW_SERIES,
+    METRICS_CONTENT_TYPE,
+    MODULE,
+    NODE,
+    TENANT,
+    flow_series,
+    operations,
+)
 from paho.mqtt.enums import CallbackAPIVersion
 from paho.mqtt.subscribeoptions import SubscribeOptions
 
@@ -31,6 +42,9 @@ OWN = {ALARM_VARIABLE: "alarm", ALARM_COUNT_VARIABLE: "alarm_count"}
 
 telemetry: "queue.Queue[dict]" = queue.Queue()
 replies: "queue.Queue[dict]" = queue.Queue()
+# What the flow metrics must count: the inputs sent, and the readings the module answered with.
+inputs_sent = 0
+readings_sent = 0
 
 
 def fail(what):
@@ -59,10 +73,28 @@ def http_status(path):
         return getattr(error, "code", None)
 
 
+def metrics():
+    """The module's flow metrics, checked against the common contract: exactly its 17 series."""
+    try:
+        with urllib.request.urlopen(MODULE_HTTP + "/metrics", timeout=2) as response:
+            content_type = response.headers.get("Content-Type")
+            count, series = flow_series(response.read().decode())
+    except OSError as error:
+        fail(f"GET /metrics: {error}")
+    check(content_type == METRICS_CONTENT_TYPE, "GET /metrics answers in Prometheus text format")
+    check(
+        count == len(FLOW_SERIES) and set(series) == FLOW_SERIES,
+        "GET /metrics serves exactly the 17 flow series",
+    )
+    return series
+
+
 def send_input(name, value):
+    global inputs_sent
     body = {"name": name, "timestamp": int(time.time() * 1000), "value": value,
             "variableId": f"variable-{name}"}
     client.publish(INPUT_TOPIC, json.dumps(body), qos=1).wait_for_publish()
+    inputs_sent += 1
 
 
 def readings():
@@ -82,8 +114,10 @@ def readings():
 
 
 def expect(value, alarm, count):
+    global readings_sent
     send_input("temp_avg", value)
     got = readings()
+    readings_sent += len(got)
     check(got == {"alarm": alarm, "alarm_count": count},
           f"temp_avg {value}: alarm {alarm}, alarm_count {count} (got {got})")
 
@@ -102,6 +136,8 @@ while http_status("/readyz") != 200 and time.monotonic() < end:
     time.sleep(0.5)
 check(http_status("/readyz") == 200, "GET /readyz answers 200 once subscribed")
 check(http_status("/healthz") == 200, "GET /healthz answers 200")
+series = metrics()
+check(series["newboot_flow_mqtt_connected"] == 1, "newboot_flow_mqtt_connected is 1 once ready")
 
 # Limits 10..30 from the twin at start.
 expect(20, 0, 0)
@@ -129,6 +165,20 @@ except queue.Empty:
 check(answer and answer.get("result") == {"reloaded": True}, f"reload: {answer}")
 expect(20, 0, 2)
 expect(27, 1, 3)
+
+# Every input is one receive and one process (temp_f and a non-number temp_avg are valid
+# messages the handler skips), every reading one enqueue; the reload is never counted.
+series = metrics()
+for operation, outcome, expected in (
+    ("receive", "success", inputs_sent),
+    ("process", "success", inputs_sent),
+    ("enqueue", "success", readings_sent),
+    ("receive", "error", 0),
+    ("process", "error", 0),
+    ("enqueue", "error", 0),
+):
+    got = operations(series, operation, outcome)
+    check(got == expected, f"{operation} {outcome}: {expected} (got {got})")
 
 client.loop_stop()
 print("ALERTS: 3", flush=True)

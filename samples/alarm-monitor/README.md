@@ -9,8 +9,10 @@ times the alarm went from 0 to 1 since the module started). Each time the alarm 
 At start it waits for its module twin, retrying every 3 s while the fetch fails; deployed without
 a twin it stops at once, since it would know neither its limits nor its variables.
 
-It uses only the SDK's public API and serves `/healthz` and `/readyz` (ready once connected and
-subscribed) on port 8080.
+It uses only the SDK's public API and serves on port 8080 `/healthz`, `/readyz` (ready once
+connected and subscribed) and `/metrics`: the SDK's flow metrics, which the Newboot console's
+data-flow view reads (each linked message is one `receive` and one `process`, each reading sent
+one `enqueue`).
 
 ## The sample pipeline
 
@@ -89,8 +91,9 @@ cargo test -p alarm-monitor
 The SDK's end-to-end test runs this sample too, after the example module: `e2e/run.sh` starts it
 against a throwaway broker and module twin server (its twin profile `alarm-monitor`: limits 10..30,
 lowered to 25 by a reload), sends it `temp_avg` readings as the smoother would, and checks its
-`alarm` and `alarm_count` readings, its silence on other inputs, the limits after a reload, one
-`alert would be sent` per alarm, and that the alert token never appears in its log.
+`alarm` and `alarm_count` readings, its silence on other inputs, the limits after a reload, its
+flow metrics, one `alert would be sent` per alarm, and that the alert token never appears in its
+log.
 
 ## Run it in a Superset
 

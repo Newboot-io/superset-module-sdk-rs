@@ -9,6 +9,8 @@ into every module and gives you its four operations without re-implementing the 
 - **receive telemetry** from the modules your Superset links to this one;
 
 and it answers the Superset's **`reload`** command for you (the module twin changed: fetch it again).
+It also counts the module's data flow for the Newboot console: serve `metrics()` on `/metrics`
+(see [`metrics()`](#metrics---string-and-flow)).
 
 The same API exists for TypeScript and Python:
 [superset-module-sdk-ts](https://github.com/Newboot-io/superset-module-sdk-ts) and
@@ -83,8 +85,8 @@ async fn main() -> superset_module_sdk::Result<()> {
 ```
 
 [`examples/minimal`](examples/minimal) is a complete module: it sends one reading per variable every
-5 s, logs linked inputs by name only, follows reloads, and serves `/healthz` and `/readyz` on port
-8080. Build its image from the repository root:
+5 s, logs linked inputs by name only, follows reloads, and serves `/healthz`, `/readyz` and
+`/metrics` on port 8080. Build its image from the repository root:
 
 ```sh
 docker build -f examples/minimal/Dockerfile -t minimal-module .
@@ -185,7 +187,7 @@ Errors: `Error::Closed` when called after `close()`: create a new client instead
 
 True once connected **and** every subscription is granted; false before `connect()`, while
 reconnecting and after `close()`. This is what a module's `/readyz` should answer. Health endpoints
-are the module's job: the example serves `/healthz` and `/readyz` on port 8080.
+are the module's job: the example serves `/healthz`, `/readyz` and `/metrics` on port 8080.
 
 ### `send_telemetry(Telemetry) -> Result<bool>`
 
@@ -196,8 +198,10 @@ Without a name, the reading takes its variable's `name` from the last fetched tw
 `variableId` should be a key of `variables` in the module twin.
 
 Returns `Ok(true)` when the reading was handed to the connected client, `Ok(false)` when the client
-is not connected (before `connect()`, while reconnecting, after `close()`): nothing is queued while
-disconnected, so send again on your next round.
+is not connected (before `connect()`, while reconnecting, after `close()`) or its local request
+queue is full: nothing is queued while disconnected, so send again on your next round. Either
+counts one `enqueue` (see [`metrics()`](#metrics---string-and-flow)), a success for `Ok(true)`
+only; a reading refused with `Error::Telemetry` never reaches the MQTT client and is not counted.
 
 Errors: `Error::Telemetry` naming the field:
 
@@ -249,10 +253,67 @@ std::panic::set_hook(Box::new(|info| {
 }));
 ```
 
+### `metrics() -> String` and `flow()`
+
+The Newboot console's data-flow view shows whether a deployed module is flowing, idle or failing
+from the common module flow metrics; without them the module shows "Activity unknown". `metrics()`
+renders them in the Prometheus text format: serve it on `GET /metrics` on port 8080 (the container
+port named `http`) with the content type `METRICS_CONTENT_TYPE`
+(`text/plain; version=0.0.4; charset=utf-8`), as the example does:
+
+```rust,no_run
+use superset_module_sdk::{ModuleClient, METRICS_CONTENT_TYPE};
+
+/// The `/metrics` answer; with axum: `.route("/metrics", get(move || async move { … }))`.
+fn metrics(client: &ModuleClient) -> ([(&'static str, &'static str); 1], String) {
+    ([("content-type", METRICS_CONTENT_TYPE)], client.metrics())
+}
+```
+
+There are always 17 series: `newboot_flow_mqtt_connected` (`1` connected and subscribed, `0`
+disconnected or reconnecting, `-1` until first observed), and per operation
+`newboot_flow_operations_total{operation,outcome}` (outcome `success` or `error`),
+`newboot_flow_last_success_timestamp_seconds{operation}` and
+`newboot_flow_last_error_timestamp_seconds{operation}` (Unix seconds, `0` before the first). No
+other label is ever added. The client records:
+
+| Operation | Counted once per                                                               |
+|-----------|--------------------------------------------------------------------------------|
+| `receive` | message from a linked module (not a stored message, never a command or reload) |
+| `process` | such message: a success when valid and no handler panicked, else an error      |
+| `enqueue` | `send_telemetry` returning `Ok`: `Ok(true)` a success, `Ok(false)` an error    |
+| `acquire` | never by the SDK: record it on `flow()` when the module reads its machine      |
+
+An `enqueue` success means the local MQTT client took the reading, not that the broker or the
+cloud received it: the contract counts local queue acceptance. `Ok(false)` is an error both when
+the client is not connected and when its local request queue (64 requests) is full. Under
+backpressure, a stalled connection therefore shows enqueue errors, and the console "Flow errors",
+before the drop itself is detected.
+
+The platform's collector scrapes `/metrics` on the container named `module`, port `http` (8080),
+every 15 s; the console reads rates over 2 minutes, which handle restarts.
+
+`flow()` gives the client's `Flow`, shared by every clone; record your own reads there, once per
+read, after it succeeded or failed:
+
+```rust,no_run
+use superset_module_sdk::{FlowOperation, ModuleClient};
+
+/// Reads the machine once (here a file stands in for it) and records the read.
+fn read_machine(client: &ModuleClient) -> std::io::Result<String> {
+    let reading = std::fs::read_to_string("/dev/my-sensor");
+    client.flow().record(FlowOperation::Acquire, reading.is_ok());
+    reading
+}
+```
+
+Counters live in the process and restart from zero when the module restarts.
+
 ### `close().await`
 
-Disconnects and stops the connection's task. `is_connected()` is false afterwards; `connect()`
-then fails with `Error::Closed` (create a new client).
+Disconnects and stops the connection's task. It returns within about 4 s even if a handler blocks
+the task; such a handler finishes in the background. `is_connected()` is false afterwards;
+`connect()` then fails with `Error::Closed` (create a new client).
 
 ## Security notes
 
@@ -294,8 +355,8 @@ cargo llvm-cov --package superset-module-sdk --summary-only   # coverage, needs 
 End-to-end, Docker only: builds the example module, runs it the way a Superset does (uid 10001,
 read-only root, no capabilities) against a Mosquitto broker with default-deny access rules and a
 module twin server, on an internal Docker network with a throwaway CA, then checks telemetry,
-linked inputs, health probes, reloads (including failing and slow twin answers) and silence for
-every command the SDK must not answer. It then runs the alarm-monitor sample the same way and checks
+linked inputs, health probes, flow metrics, reloads (including failing and slow twin answers) and
+silence for every command the SDK must not answer. It then runs the alarm-monitor sample the same way and checks
 its alarms. Everything it creates is labelled and removed on exit.
 
 ```sh

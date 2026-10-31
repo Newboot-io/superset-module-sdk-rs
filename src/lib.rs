@@ -25,6 +25,9 @@
 //!
 //! The SDK answers the Superset's `reload` command itself; other commands are left unanswered
 //! in this release.
+//!
+//! [`ModuleClient::metrics`] renders the module's [flow observations](flow) for the Newboot
+//! console: serve it on `GET /metrics` (port 8080) with [`METRICS_CONTENT_TYPE`].
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -32,6 +35,7 @@ mod client;
 pub mod command;
 pub mod config;
 mod error;
+pub mod flow;
 pub mod secrets;
 pub mod telemetry;
 pub mod topics;
@@ -40,6 +44,7 @@ pub mod twin;
 pub use client::{ModuleClient, MAX_PACKET_BYTES, RECONNECT_AFTER};
 pub use config::ModuleConfig;
 pub use error::{Error, Result, SecretError, TwinError};
+pub use flow::{Flow, FlowOperation, METRICS_CONTENT_TYPE};
 pub use telemetry::{InputTelemetry, Telemetry};
 pub use twin::ModuleTwin;
 

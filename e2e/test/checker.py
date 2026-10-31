@@ -1,6 +1,6 @@
 """Drives the running example module over the test broker and asserts what the SDK promises:
-telemetry per variable of the module twin, linked-module input, health probes, reload answers,
-and silence for every command the SDK must not answer.
+telemetry per variable of the module twin, linked-module input, health probes, flow metrics,
+reload answers, and silence for every command the SDK must not answer.
 
 Linked inputs are checked from the module's log by e2e/run.sh: the last line this script prints
 before ALL CHECKS PASSED lists the input names the module must log ("KEPT INPUTS: …"); every other
@@ -22,6 +22,9 @@ from fixtures import (
     DRIP_BODY_RELOAD,
     DRIP_HEADERS_RELOAD,
     FAILING_RELOAD,
+    FLOW_OPERATIONS,
+    FLOW_SERIES,
+    METRICS_CONTENT_TYPE,
     MODULE,
     NODE,
     REDIRECT_RELOAD,
@@ -30,6 +33,8 @@ from fixtures import (
     STARTUP_VARIABLE,
     STARTUP_VARIABLE_NAME,
     TENANT,
+    flow_series,
+    operations,
     reloaded_name,
 )
 from paho.mqtt.enums import CallbackAPIVersion
@@ -48,6 +53,8 @@ MAX_TTL_MS = 30_000
 MODULE_HTTP = "http://module:8080"
 REPLY_KEYS = 3
 REPLY_PREFIX = f"output/directmethod/{TENANT}/{CLUSTER}/{MODULE}/res/"
+# Longer than this whole script runs: a last-operation time within it is recent.
+RUN_S = 600
 SCOPE = {"clusterId": CLUSTER, "moduleId": MODULE, "tenantConfigId": TENANT}
 SEND_EVERY_S = 5
 SILENCE_S = 3
@@ -58,6 +65,8 @@ WAIT_S = 15
 
 telemetry: "queue.Queue[dict]" = queue.Queue()
 replies: "dict[str, queue.Queue[dict]]" = {}
+# Inputs sent without the retain flag: each is one receive and one process in the flow metrics.
+live_inputs = 0
 
 
 def fail(what):
@@ -166,9 +175,27 @@ def http_status(path):
         return getattr(error, "code", None)
 
 
+def metrics():
+    """The module's flow metrics, checked against the common contract: exactly its 17 series."""
+    try:
+        with urllib.request.urlopen(MODULE_HTTP + "/metrics", timeout=2) as response:
+            content_type = response.headers.get("Content-Type")
+            count, series = flow_series(response.read().decode())
+    except OSError as error:
+        fail(f"GET /metrics: {error}")
+    check(content_type == METRICS_CONTENT_TYPE, "GET /metrics answers in Prometheus text format")
+    check(
+        count == len(FLOW_SERIES) and set(series) == FLOW_SERIES,
+        "GET /metrics serves exactly the 17 flow series",
+    )
+    return series
+
+
 def send_input(name, value, retain=False, raw=None):
+    global live_inputs
     body = raw or json.dumps({"name": name, "value": value, "variableId": f"variable-{name}"})
     publish(INPUT_TOPIC, body, retain)
+    live_inputs += not retain
 
 
 tls = ssl.create_default_context(cafile="/certs/ca.crt")
@@ -193,6 +220,9 @@ while http_status("/readyz") != 200 and time.monotonic() < end:
     time.sleep(0.5)
 check(http_status("/readyz") == 200, "GET /readyz answers 200 once subscribed")
 check(http_status("/healthz") == 200, "GET /healthz answers 200")
+series = metrics()
+check(series["newboot_flow_mqtt_connected"] == 1, "newboot_flow_mqtt_connected is 1 once ready")
+check(operations(series, "enqueue", "success") > 0, "the telemetry sent counts as enqueues")
 
 # Receiving: kept inputs reach the module's handler (which logs their names), dropped ones never.
 kept = ["kept-scalar", "kept-array", "kept-text"]
@@ -296,6 +326,30 @@ while not telemetry.empty():
 check(
     next_telemetry(2 * SEND_EVERY_S, STARTUP_VARIABLE) is None,
     "after reload, the dropped variable is no longer sent",
+)
+
+# Flow metrics: every input sent without the retain flag is one receive and one process, a
+# success for the kept ones only; the commands and reloads above are never counted.
+series = metrics()
+received = operations(series, "receive", "success")
+check(received == live_inputs, f"{live_inputs} inputs received (got {received})")
+check(operations(series, "receive", "error") == 0, "no receive error")
+processed = operations(series, "process", "success")
+check(processed == len(kept), f"{len(kept)} inputs processed (got {processed})")
+rejected = operations(series, "process", "error")
+check(rejected == live_inputs - len(kept), f"dropped inputs are process errors (got {rejected})")
+check(operations(series, "enqueue", "success") > 0, "telemetry counts as enqueue successes")
+check(
+    all(operations(series, "acquire", outcome) == 0 for outcome in ("success", "error")),
+    "acquire stays at zero: the module records it, never the SDK",
+)
+for operation, outcome in (("receive", "success"), ("process", "error"), ("enqueue", "success")):
+    at = series[f'newboot_flow_last_{outcome}_timestamp_seconds{{operation="{operation}"}}']
+    check(abs(time.time() - at) < RUN_S, f"last {operation} {outcome} is a recent Unix time")
+check(
+    all(series[f'newboot_flow_last_error_timestamp_seconds{{operation="{op}"}}'] == 0
+        for op in FLOW_OPERATIONS if op != "process"),
+    "last error is 0 for the operations that never failed",
 )
 
 client.loop_stop()

@@ -1,0 +1,16 @@
+{
+  "events": [
+    {"operation": "enqueue", "success": true, "timestampSeconds": 1},
+    {"operation": "enqueue", "success": false, "timestampSeconds": 2},
+    {"operation": "enqueue", "success": true, "timestampSeconds": 3}
+  ],
+  "expected": {
+    "newboot_flow_mqtt_connected": "-1",
+    "newboot_flow_operations_total{operation=\"enqueue\",outcome=\"success\"}": "2",
+    "newboot_flow_operations_total{operation=\"enqueue\",outcome=\"error\"}": "1",
+    "newboot_flow_operations_total{operation=\"process\",outcome=\"success\"}": "0",
+    "newboot_flow_last_success_timestamp_seconds{operation=\"enqueue\"}": "3",
+    "newboot_flow_last_error_timestamp_seconds{operation=\"enqueue\"}": "2"
+  },
+  "seriesCount": 17
+}

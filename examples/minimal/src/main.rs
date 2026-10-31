@@ -1,9 +1,12 @@
 //! A minimal module: sends one reading per variable of its module twin every few seconds, logs
-//! the linked modules' inputs by name only, and serves /healthz and /readyz on port 8080.
-use axum::{http::StatusCode, routing::get, Router};
+//! the linked modules' inputs by name only, and serves /healthz, /readyz and /metrics on port
+//! 8080.
+use axum::{http::header, http::StatusCode, routing::get, Router};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use superset_module_sdk::{telemetry::now_ms, InputTelemetry, ModuleClient, ModuleTwin, Telemetry};
+use superset_module_sdk::{
+    telemetry::now_ms, InputTelemetry, ModuleClient, ModuleTwin, Telemetry, METRICS_CONTENT_TYPE,
+};
 
 const HEALTH_PORT: u16 = 8080;
 const RETRY_TWIN_AFTER: Duration = Duration::from_secs(3);
@@ -83,9 +86,16 @@ async fn main() {
             }
         }
     };
+    // The Newboot console's data-flow view reads the SDK's flow observations here.
+    let observed = client.clone();
+    let metrics = move || {
+        let body = observed.metrics();
+        async move { ([(header::CONTENT_TYPE, METRICS_CONTENT_TYPE)], body) }
+    };
     let health = Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
-        .route("/readyz", get(readyz));
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics));
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", HEALTH_PORT))
         .await
         .expect("health port");

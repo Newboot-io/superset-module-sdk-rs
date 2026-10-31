@@ -1,13 +1,13 @@
 //! alarm-monitor: watches the smoothed temperature (`temp_avg`) a linked module sends and raises
 //! an alarm when it leaves the band its twin sets. Sends `alarm` (0 or 1) and `alarm_count` on
-//! every `temp_avg` it receives; serves /healthz and /readyz on port 8080.
+//! every `temp_avg` it receives; serves /healthz, /readyz and /metrics on port 8080.
 mod alarm;
 
 use alarm::{temp_avg, AlarmState, Limits, Owned, ALARM, ALARM_COUNT};
-use axum::{http::StatusCode, routing::get, Router};
+use axum::{http::header, http::StatusCode, routing::get, Router};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use superset_module_sdk::{Error, ModuleClient, ModuleTwin, TwinError};
+use superset_module_sdk::{Error, ModuleClient, ModuleTwin, TwinError, METRICS_CONTENT_TYPE};
 
 const ALERT_TOKEN: &str = "alert-token";
 const HEALTH_PORT: u16 = 8080;
@@ -59,7 +59,7 @@ async fn main() {
     }
 
     let health = {
-        let probe = client.clone();
+        let (probe, observed) = (client.clone(), client.clone());
         Router::new()
             .route("/healthz", get(|| async { StatusCode::OK }))
             .route(
@@ -73,6 +73,14 @@ async fn main() {
                             StatusCode::SERVICE_UNAVAILABLE
                         }
                     }
+                }),
+            )
+            // The SDK's flow observations, for the Newboot console's data-flow view.
+            .route(
+                "/metrics",
+                get(move || {
+                    let body = observed.metrics();
+                    async move { ([(header::CONTENT_TYPE, METRICS_CONTENT_TYPE)], body) }
                 }),
             )
     };

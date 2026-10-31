@@ -46,3 +46,34 @@ ALARM_VARIABLE = "variable-1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
 ALARM_COUNT_VARIABLE = "variable-2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e"
 ALARM_LIMITS = {"highLimit": 30, "lowLimit": 10}
 ALARM_RELOADED_LIMITS = {"highLimit": 25, "lowLimit": 10}
+
+
+# The common module flow contract: GET /metrics on the module's port 8080 serves exactly these 17
+# series, and nothing else.
+METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+FLOW_OPERATIONS = ("acquire", "receive", "process", "enqueue")
+FLOW_SERIES = {
+    "newboot_flow_mqtt_connected",
+    *(
+        f'newboot_flow_operations_total{{operation="{operation}",outcome="{outcome}"}}'
+        for operation in FLOW_OPERATIONS
+        for outcome in ("success", "error")
+    ),
+    *(
+        f'newboot_flow_last_{outcome}_timestamp_seconds{{operation="{operation}"}}'
+        for operation in FLOW_OPERATIONS
+        for outcome in ("success", "error")
+    ),
+}
+
+
+def flow_series(text):
+    """A /metrics answer: how many series it has, and their values by name and labels."""
+    lines = [line for line in text.splitlines() if line and not line.startswith("#")]
+    series = (line.rsplit(" ", 1) for line in lines)
+    return len(lines), {name: float(value) for name, value in series}
+
+
+def operations(series, operation, outcome):
+    """One operation's count for one outcome."""
+    return series[f'newboot_flow_operations_total{{operation="{operation}",outcome="{outcome}"}}']
