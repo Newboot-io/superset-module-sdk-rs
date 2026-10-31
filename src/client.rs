@@ -4,6 +4,7 @@ use crate::command::{
 };
 use crate::config::{ModuleConfig, Mqtt, Target};
 use crate::error::{Error, Result};
+use crate::flow::{self, FlowOperation};
 use crate::secrets;
 use crate::telemetry::{now_ms, parse_input, InputTelemetry, Telemetry};
 use crate::twin::{fetch_twin, ModuleTwin};
@@ -43,7 +44,9 @@ struct Inner {
     /// Set by `close()`: the client cannot connect again.
     closed: AtomicBool,
     config: ModuleConfig,
-    connected: AtomicBool,
+    /// What `metrics()` renders: `receive`, `process`, `enqueue`, and the connection, which is
+    /// also the readiness (`set_connected`): `/metrics` and `is_connected()` never disagree.
+    flow: flow::Flow,
     /// The last twin fetched, by `get_twin` or a reload: it names the variables sent.
     last_twin: Mutex<Option<ModuleTwin>>,
     mqtt: Mutex<Option<AsyncClient>>,
@@ -70,7 +73,7 @@ impl ModuleClient {
             inner: Arc::new(Inner {
                 closed: AtomicBool::new(false),
                 config,
-                connected: AtomicBool::new(false),
+                flow: flow::Flow::new(),
                 last_twin: Mutex::new(None),
                 mqtt: Mutex::new(None),
                 on_telemetry: RwLock::new(Vec::new()),
@@ -176,26 +179,51 @@ impl ModuleClient {
     /// while reconnecting and after [`close`](Self::close). This is what a module's `/readyz`
     /// should answer.
     pub fn is_connected(&self) -> bool {
-        self.inner.connected.load(Ordering::Acquire)
+        self.inner.flow.is_connected()
     }
 
     /// Publishes one reading on the module's telemetry topic, QoS 0, not retained. Without a
     /// name, the reading takes its variable's `name` from the last fetched twin, if any.
     ///
     /// Returns `Ok(true)` when the reading was handed to the connected client, `Ok(false)` when
-    /// the client is not connected (nothing is queued while disconnected).
+    /// the client is not connected (nothing is queued while disconnected) or its local request
+    /// queue is full. Either is one `enqueue` in [`metrics`](Self::metrics), a success for
+    /// `Ok(true)` only.
     ///
-    /// Errors: [`Error::Telemetry`] naming the field that breaks the payload rules.
+    /// Errors: [`Error::Telemetry`] naming the field that breaks the payload rules. The reading
+    /// never reaches the MQTT client: no `enqueue` is recorded.
     pub fn send_telemetry(&self, telemetry: Telemetry) -> Result<bool> {
         let payload = self.inner.telemetry_payload(&telemetry)?;
         let topic = self.inner.config.target.telemetry_topic();
-        Ok(self.inner.publish(topic, payload))
+        let sent = self.inner.publish(topic, payload);
+        self.inner.flow.record(FlowOperation::Enqueue, sent);
+        Ok(sent)
     }
 
-    /// Disconnects and stops the connection's task. The client cannot connect again.
+    /// The module's flow observations in the Prometheus text format, for the Newboot console's
+    /// data-flow view: serve them on `GET /metrics` (port 8080) with
+    /// [`METRICS_CONTENT_TYPE`](crate::METRICS_CONTENT_TYPE). These are the 17 series of the
+    /// common module flow contract: the MQTT connection (`-1` until first observed), and per
+    /// operation its success and error counts and its last success and last error. The client
+    /// records `receive` (a message from a linked module), `process` (it was decoded and every
+    /// handler returned, or not), `enqueue` ([`send_telemetry`](Self::send_telemetry)) and the
+    /// connection; commands and reloads are not counted. Counters restart from zero with the
+    /// process.
+    pub fn metrics(&self) -> String {
+        self.inner.flow.render()
+    }
+
+    /// The flow observations [`metrics`](Self::metrics) renders, shared by every clone. Record
+    /// [`FlowOperation::Acquire`] here when the module reads its machine or sensor.
+    pub fn flow(&self) -> &flow::Flow {
+        &self.inner.flow
+    }
+
+    /// Disconnects and stops the connection's task, returning within about 4 s even if a handler
+    /// blocks it (that handler then finishes in the background). The client cannot connect again.
     pub async fn close(&self) {
         self.inner.closed.store(true, Ordering::Release);
-        self.inner.connected.store(false, Ordering::Release);
+        self.inner.set_connected(false);
         self.inner.wake.notify_one();
         if let Some(client) = self.inner.mqtt.lock().unwrap().take() {
             let _ = client.try_disconnect();
@@ -204,12 +232,21 @@ impl ModuleClient {
         if let Some(mut task) = task {
             if tokio::time::timeout(CLOSE_WITHIN, &mut task).await.is_err() {
                 task.abort();
+                // Bounded too: a handler blocking the task cannot hang close().
+                let _ = tokio::time::timeout(CLOSE_WITHIN, task).await;
             }
         }
+        // A SUBACK handled while closing must not leave the client ready.
+        self.inner.set_connected(false);
     }
 }
 
 impl Inner {
+    /// Readiness, which is the flow's connection.
+    fn set_connected(&self, connected: bool) {
+        self.flow.connection(connected);
+    }
+
     async fn fetch_twin(&self, correlation_id: Option<&str>) -> Result<ModuleTwin> {
         let twin = self
             .config
@@ -237,7 +274,7 @@ impl Inner {
     /// Hands a message to the client only while connected and subscribed: nothing is queued
     /// for later. False when not connected or the client's queue is full.
     fn publish(&self, topic: String, payload: String) -> bool {
-        if !self.connected.load(Ordering::Acquire) {
+        if !self.flow.is_connected() {
             return false;
         }
         let client = self.mqtt.lock().unwrap();
@@ -255,14 +292,18 @@ impl Inner {
             .is_some_and(|(topic, body)| self.publish(topic, body))
     }
 
-    /// Every telemetry handler, in order; a panicking one is reported and skipped.
-    fn deliver(&self, input: &InputTelemetry) {
+    /// Every telemetry handler, in order; a panicking one is reported and skipped. False when
+    /// one panicked.
+    fn deliver(&self, input: &InputTelemetry) -> bool {
         let handlers = self.on_telemetry.read().unwrap().clone();
+        let mut handled = true;
         for handler in handlers {
             if catch_unwind(AssertUnwindSafe(|| handler(input))).is_err() {
                 eprintln!("telemetry handler panicked");
+                handled = false;
             }
         }
+        handled
     }
 
     /// Every twin-change handler, in order; false as soon as one panics.
@@ -303,7 +344,18 @@ impl Inner {
             now_ms(),
         ) {
             Route::Ignore => return,
-            Route::Input(input) => return self.deliver(&input),
+            // One `receive` and one `process` per message from a linked module.
+            Route::Input(input) => {
+                self.flow.record(FlowOperation::Receive, true);
+                let handled = self.deliver(&input);
+                self.flow.record(FlowOperation::Process, handled);
+                return;
+            }
+            Route::Invalid => {
+                self.flow.record(FlowOperation::Receive, true);
+                self.flow.record(FlowOperation::Process, false);
+                return;
+            }
             Route::Answer(command, answer) => {
                 self.reply(&command, answer);
                 return;
@@ -346,10 +398,13 @@ impl Inner {
 enum Route {
     /// Answer a command at once.
     Answer(Command, serde_json::Value),
-    /// Drop it: not addressed here, off time, malformed, or a command this release ignores.
+    /// Drop it: not addressed here, off time, malformed, a command this release ignores, or a
+    /// linked module's stored message.
     Ignore,
     /// A valid message from a linked module.
     Input(InputTelemetry),
+    /// Drop it: a message from a linked module that breaks the payload rules.
+    Invalid,
     /// Fetch the twin again, then answer.
     Reload(Command),
 }
@@ -361,7 +416,11 @@ fn route(config: &ModuleConfig, topic: &str, payload: &[u8], retain: bool, now: 
         .iter()
         .any(|input| input == topic)
     {
-        return parse_input(topic, payload, retain).map_or(Route::Ignore, Route::Input);
+        // A stored message, sent again on every subscription: not an input received now.
+        if retain {
+            return Route::Ignore;
+        }
+        return parse_input(topic, payload, retain).map_or(Route::Invalid, Route::Input);
     }
     match parse_command(topic, payload, retain, &config.target, now) {
         // v0.1 answers reload only; any other command is left unanswered.
@@ -435,13 +494,14 @@ fn handle(inner: &Arc<Inner>, event: Event) -> Flow {
             if !granted {
                 eprintln!("mqtt: subscription refused");
             }
-            inner.connected.store(granted, Ordering::Release);
+            // Never ready again once closed.
+            inner.set_connected(granted && !inner.closed.load(Ordering::Acquire));
         }
         Event::Incoming(Packet::Publish(message)) => inner.receive(message),
         // A DISCONNECT goes out on close(), and also when rumqttc meets a protocol error:
         // only close() ends the task.
         Event::Outgoing(Outgoing::Disconnect) => {
-            inner.connected.store(false, Ordering::Release);
+            inner.set_connected(false);
             if inner.closed.load(Ordering::Acquire) {
                 return Flow::Stop;
             }
@@ -453,7 +513,17 @@ fn handle(inner: &Arc<Inner>, event: Event) -> Flow {
     Flow::Next
 }
 
+/// Not ready once the connection's task ends, however it ends (aborted, or a panic included).
+struct NotReadyOnExit(Arc<Inner>);
+
+impl Drop for NotReadyOnExit {
+    fn drop(&mut self) {
+        self.0.set_connected(false);
+    }
+}
+
 async fn run(inner: Arc<Inner>, mut events: EventLoop) {
+    let _not_ready_on_exit = NotReadyOnExit(inner.clone());
     'connection: loop {
         match transport(&inner.config.mqtt) {
             Ok(transport) => {
@@ -461,6 +531,7 @@ async fn run(inner: Arc<Inner>, mut events: EventLoop) {
             }
             Err(error) => {
                 eprintln!("mqtt: cannot read the certificates: {error}");
+                inner.set_connected(false);
                 if inner.pause().await {
                     continue;
                 }
@@ -484,7 +555,7 @@ async fn run(inner: Arc<Inner>, mut events: EventLoop) {
                     }
                 },
                 Err(error) => {
-                    inner.connected.store(false, Ordering::Release);
+                    inner.set_connected(false);
                     if inner.closed.load(Ordering::Acquire) {
                         break 'connection;
                     }
@@ -497,7 +568,6 @@ async fn run(inner: Arc<Inner>, mut events: EventLoop) {
             }
         }
     }
-    inner.connected.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -563,8 +633,8 @@ mod tests {
                 .unwrap()
                 .push(format!("3:{}", input.variable_id))
         });
-        client.inner.deliver(&input());
-        client.inner.deliver(&input());
+        assert!(!client.inner.deliver(&input()), "a handler panicked");
+        assert!(!client.inner.deliver(&input()), "a handler panicked");
         assert_eq!(*calls.lock().unwrap(), ["1:v", "3:v", "1:v", "3:v"]);
     }
 
@@ -643,31 +713,74 @@ mod tests {
     #[test]
     fn a_disconnect_reconnects_unless_the_client_closed() {
         let client = ModuleClient::new(config());
-        client.inner.connected.store(true, Ordering::Release);
+        client.inner.set_connected(true);
         let disconnect = || Event::Outgoing(Outgoing::Disconnect);
         // A protocol error makes rumqttc send DISCONNECT: the task reconnects.
         assert_eq!(handle(&client.inner, disconnect()), Flow::Reconnect);
         assert!(!client.is_connected());
+        assert!(connected_series(&client, "0"));
         client.inner.closed.store(true, Ordering::Release);
         assert_eq!(handle(&client.inner, disconnect()), Flow::Stop);
+    }
+
+    /// The flow's connection series has this value.
+    fn connected_series(client: &ModuleClient, value: &str) -> bool {
+        let line = format!("newboot_flow_mqtt_connected {value}");
+        client.metrics().lines().any(|l| l == line)
     }
 
     #[test]
     fn ready_only_when_every_subscription_is_granted() {
         let client = ModuleClient::new(config());
+        assert!(connected_series(&client, "-1"), "not yet observed");
         let granted = SubscribeReasonCode::Success(QoS::AtLeastOnce);
         assert_eq!(
             handle(&client.inner, suback(vec![granted, granted])),
             Flow::Next
         );
         assert!(client.is_connected());
+        assert!(connected_series(&client, "1"));
         let refused = suback(vec![granted, SubscribeReasonCode::NotAuthorized]);
         assert_eq!(handle(&client.inner, refused), Flow::Next);
         assert!(!client.is_connected());
+        assert!(connected_series(&client, "0"));
         assert_eq!(
             handle(&client.inner, Event::Outgoing(Outgoing::PingReq)),
             Flow::Next
         );
+    }
+
+    #[test]
+    fn a_suback_after_close_leaves_the_client_not_ready() {
+        let client = ModuleClient::new(config());
+        client.inner.closed.store(true, Ordering::Release);
+        let granted = SubscribeReasonCode::Success(QoS::AtLeastOnce);
+        assert_eq!(handle(&client.inner, suback(vec![granted])), Flow::Next);
+        assert!(!client.is_connected());
+        assert!(connected_series(&client, "0"));
+    }
+
+    fn enqueues(client: &ModuleClient, outcome: &str) -> bool {
+        let line = format!(
+            "newboot_flow_operations_total{{operation=\"enqueue\",outcome=\"{outcome}\"}} 1"
+        );
+        client.metrics().lines().any(|l| l == line)
+    }
+
+    #[tokio::test]
+    async fn a_full_request_queue_is_an_enqueue_error() {
+        let client = ModuleClient::new(config());
+        // The event loop is never polled: the client's request queue only fills.
+        let (mqtt, _events) = AsyncClient::new(mqtt_options(&config()).unwrap(), 1);
+        *client.inner.mqtt.lock().unwrap() = Some(mqtt);
+        client.inner.set_connected(true);
+        assert!(client.send_telemetry(Telemetry::new("v", 1)).unwrap());
+        assert!(enqueues(&client, "success"));
+        assert!(
+            !client.send_telemetry(Telemetry::new("v", 1)).unwrap(),
+            "queue full"
+        );
+        assert!(enqueues(&client, "error"));
     }
 
     #[test]
@@ -700,7 +813,7 @@ mod tests {
         assert!(!client.inner.reply(&command, reloaded()));
         assert!(!client.send_telemetry(Telemetry::new("v", 1)).unwrap());
         // Marked connected without a client: still nothing sent, never a panic.
-        client.inner.connected.store(true, Ordering::Release);
+        client.inner.set_connected(true);
         assert!(!client.inner.reply(&command, reloaded()));
     }
 
@@ -721,7 +834,7 @@ mod tests {
         let config = config();
         assert_eq!(
             route(&config, INPUT, b"not json", false, NOW),
-            Route::Ignore
+            Route::Invalid
         );
         assert_eq!(
             route(

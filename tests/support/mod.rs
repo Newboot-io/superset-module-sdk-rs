@@ -1,17 +1,19 @@
-//! Shared test fixtures: a throwaway PKI, module configs on disk, and a one-shot HTTPS server
-//! that requires a client certificate.
+//! Shared test fixtures: a throwaway PKI, module configs on disk, a one-shot HTTPS server
+//! that requires a client certificate, and the pieces of a small MQTT 5 broker stub.
 #![allow(dead_code)]
 
 use rcgen::{BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use superset_module_sdk::ModuleConfig;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{RootCertStore, ServerConfig};
+use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
 pub const SECRET_VALUE: &str = "e2e-unit-s3cret";
@@ -178,4 +180,114 @@ pub fn http(status: &str, body: &[u8]) -> Vec<u8> {
     .into_bytes();
     answer.extend_from_slice(body);
     answer
+}
+
+// The MQTT 5 broker stub: just enough of the protocol to connect, subscribe and publish.
+
+pub const CONNECT: u8 = 0x10;
+pub const CONNACK: &[u8] = &[0x20, 0x03, 0x00, 0x00, 0x00]; // no session, success, no properties
+pub const SUBSCRIBE: u8 = 0x82;
+pub const DISCONNECT: u8 = 0xe0;
+/// PUBLISH, QoS 0: an empty topic and the property "topic alias" (0x23) = 5, never defined.
+pub const UNKNOWN_ALIAS: &[u8] = &[0x30, 0x06, 0x00, 0x00, 0x03, 0x23, 0x00, 0x05];
+pub const STEP: Duration = Duration::from_secs(10);
+
+/// One MQTT packet: its first header byte and its body.
+pub async fn read_packet(stream: &mut (impl AsyncRead + Unpin)) -> (u8, Vec<u8>) {
+    let kind = stream.read_u8().await.unwrap();
+    let (mut length, mut shift) = (0usize, 0);
+    loop {
+        let byte = stream.read_u8().await.unwrap();
+        length |= usize::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).await.unwrap();
+    (kind, body)
+}
+
+/// A variable byte integer and the bytes it took.
+pub fn varint(bytes: &[u8]) -> (usize, usize) {
+    let (mut value, mut used) = (0usize, 0);
+    for (i, byte) in bytes.iter().enumerate() {
+        value |= usize::from(byte & 0x7f) << (7 * i);
+        used = i + 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    (value, used)
+}
+
+/// The SUBACK granting every filter of a SUBSCRIBE body, at QoS 1.
+pub fn suback(subscribe: &[u8]) -> Vec<u8> {
+    let (properties, used) = varint(&subscribe[2..]);
+    let mut at = 2 + used + properties;
+    let mut filters = 0u8;
+    while at < subscribe.len() {
+        let length = usize::from(u16::from_be_bytes([subscribe[at], subscribe[at + 1]]));
+        at += 2 + length + 1; // the filter, then its options byte
+        filters += 1;
+    }
+    let mut packet = vec![0x90, 3 + filters, subscribe[0], subscribe[1], 0x00];
+    packet.extend(std::iter::repeat_n(0x01, usize::from(filters)));
+    packet
+}
+
+pub async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+    let end = Instant::now() + STEP;
+    while !condition() {
+        assert!(Instant::now() < end, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A variable byte integer.
+pub fn encode_varint(mut value: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = (value % 128) as u8;
+        value /= 128;
+        if value == 0 {
+            bytes.push(byte);
+            return bytes;
+        }
+        bytes.push(byte | 0x80);
+    }
+}
+
+/// A PUBLISH at QoS 0, without properties.
+pub fn publish(topic: &str, payload: &[u8], retain: bool) -> Vec<u8> {
+    let mut body = (topic.len() as u16).to_be_bytes().to_vec();
+    body.extend_from_slice(topic.as_bytes());
+    body.push(0x00); // no properties
+    body.extend_from_slice(payload);
+    let mut packet = vec![0x30 | u8::from(retain)];
+    packet.extend(encode_varint(body.len()));
+    packet.extend(body);
+    packet
+}
+
+/// Accepts the client's next connection and answers its CONNECT and SUBSCRIBE: once this
+/// returns, the client is about to be ready.
+pub async fn accept_and_subscribe(
+    acceptor: &TlsAcceptor,
+    listener: &TcpListener,
+) -> TlsStream<TcpStream> {
+    let accept = async {
+        acceptor
+            .accept(listener.accept().await.unwrap().0)
+            .await
+            .unwrap()
+    };
+    let mut stream = tokio::time::timeout(STEP, accept).await.unwrap();
+    assert_eq!(read_packet(&mut stream).await.0, CONNECT);
+    stream.write_all(CONNACK).await.unwrap();
+    let (kind, subscribe) = read_packet(&mut stream).await;
+    assert_eq!(kind, SUBSCRIBE);
+    stream.write_all(&suback(&subscribe)).await.unwrap();
+    stream
 }
