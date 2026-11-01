@@ -98,6 +98,7 @@ log.
 ## Run it in a Superset
 
 Push the image to a registry your Superset can pull from, add the module with the two variables
-named `alarm` and `alarm_count`, the twin settings above and the secret `alert-token`, then link its
-input to the smoother sample. The Superset mounts the module's `module.json`, certificates and
-secret; the module needs nothing else.
+named `alarm` and `alarm_count`, the twin settings above and the secret `alert-token` (label "Alert
+token": would authenticate the alert webhook), then link its input to the smoother sample. Set the
+secret's value on the module's **Secrets** tab in the console before you deploy. The Superset
+mounts the module's `module.json`, certificates and secret; the module needs nothing else.

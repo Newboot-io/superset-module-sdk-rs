@@ -164,6 +164,13 @@ Errors: `Error::Secret { name, reason }` with `SecretError::NotDeclared`, `Unrea
 `NotAString`, naming the first secret that fails. The message names the secret only, never its
 value nor the parser's message (which could quote the file).
 
+Each secret your module reads is declared in its description in your Superset catalog: its name
+(lowercase letters, digits and hyphens: the `<name>` of its file), a short label and what it is
+for. Whoever manages the cluster sets each value on the module's **Secrets** tab in the Newboot
+console, which shows that label and purpose. A deploy is refused until every secret the module
+uses has a value; a new value replaces the file within about five minutes while the module runs.
+Values are write-only: neither the console nor the API reads one back.
+
 ### `connect().await -> Result<()>`
 
 Starts the MQTT 5 connection over TLS to `brokerUrl` with `mqtt.identity` and `mqtt.ca`, on the
